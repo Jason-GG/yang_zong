@@ -8,6 +8,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import requests
+try:
+    from openpyxl import Workbook, load_workbook
+except ImportError:  # pragma: no cover
+    Workbook = None  # type: ignore[assignment]
+    load_workbook = None  # type: ignore[assignment]
 
 
 DEFAULT_QUERY_HASH = "37479f2b8209594dde7facb0d904896a"
@@ -31,6 +36,44 @@ FOLLOWER_FIELDS = [
     "biography",
     "category",
 ]
+
+
+def save_workbook_or_fail(workbook: Workbook, excel_path: Path) -> None:
+    try:
+        workbook.save(excel_path)
+    except OSError as exc:
+        raise RuntimeError(f"Failed saving Excel {excel_path}: {exc}") from exc
+
+
+def get_or_create_sheet_with_header(workbook: Workbook) -> Any:
+    if "users" in workbook.sheetnames:
+        sheet = workbook["users"]
+    else:
+        sheet = workbook.active
+        sheet.title = "users"
+
+    if sheet.max_row == 0:
+        sheet.append(FOLLOWER_FIELDS)
+    else:
+        header = [sheet.cell(row=1, column=i + 1).value for i in range(len(FOLLOWER_FIELDS))]
+        if header != FOLLOWER_FIELDS:
+            sheet.delete_rows(1, sheet.max_row)
+            sheet.append(FOLLOWER_FIELDS)
+    return sheet
+
+
+def load_seen_ids_from_sheet(sheet: Any) -> set[str]:
+    seen_ids: set[str] = set()
+    if sheet.max_row < 2:
+        return seen_ids
+
+    id_column = 1
+    for row_idx in range(2, sheet.max_row + 1):
+        follower_id = sheet.cell(row=row_idx, column=id_column).value
+        if follower_id is None:
+            continue
+        seen_ids.add(str(follower_id))
+    return seen_ids
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,8 +135,7 @@ def print_section(name: str, url: str, status_code: Optional[int], payload: Dict
     print(
         json.dumps(
             {"section": name, "url": url, "status_code": status_code, "data": payload},
-            ensure_ascii=False,
-            indent=2,
+            ensure_ascii=False
         )
     )
 
@@ -214,7 +256,10 @@ def extract_biography_and_category(payload: Any) -> Tuple[str, str]:
 
 
 def enrich_row_with_detail(
-    session: requests.Session, row: Dict[str, Any], timeout: float
+    session: requests.Session,
+    row: Dict[str, Any],
+    timeout: float,
+    query_user_id: str,
 ) -> bool:
     follower_id = str(row.get("id", ""))
     if not follower_id:
@@ -222,6 +267,19 @@ def enrich_row_with_detail(
 
     detail_url = f"https://i.instagram.com/api/v1/users/{quote(follower_id)}/info/"
     resp, err = make_get_request(session, detail_url, timeout)
+    print(
+        json.dumps(
+            {
+                "section": "detail_request",
+                "query_user_id": query_user_id,
+                "follower_id": follower_id,
+                "url": detail_url,
+                "status_code": resp.status_code if resp is not None else None,
+                "error": err,
+            },
+            ensure_ascii=False,
+        )
+    )
     if err:
         return False
     assert resp is not None
@@ -246,17 +304,22 @@ def main() -> int:
     relation_hint = "followers" if args.edge_field != "edge_follow" else "following"
     excel_path = Path(args.excel_path) if args.excel_path else Path(f"{relation_hint}_{user_id}.xlsx")
 
-    excel_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        from openpyxl import Workbook
-    except ImportError:
+    if Workbook is None or load_workbook is None:
         return fail("Missing dependency 'openpyxl'. Install it with: pip install openpyxl")
 
-    workbook = Workbook(write_only=True)
-    sheet = workbook.create_sheet("users")
-    sheet.append(FOLLOWER_FIELDS)
+    excel_path.parent.mkdir(parents=True, exist_ok=True)
 
-    seen_ids = set()
+    if excel_path.exists():
+        try:
+            workbook = load_workbook(excel_path)
+        except OSError as exc:
+            return fail(f"Failed opening Excel {excel_path}: {exc}")
+    else:
+        workbook = Workbook()
+
+    sheet = get_or_create_sheet_with_header(workbook)
+    seen_ids = load_seen_ids_from_sheet(sheet)
+
     cursor = args.after
     page = 1
     total_count: Optional[int] = None
@@ -319,13 +382,14 @@ def main() -> int:
                     continue
                 seen_ids.add(follower_id)
 
-                if enrich_row_with_detail(session, follower, args.timeout):
+                if enrich_row_with_detail(session, follower, args.timeout, user_id):
                     enriched_ok += 1
                 else:
                     enriched_fail += 1
 
                 sheet.append([follower.get(field) for field in FOLLOWER_FIELDS])
                 count_exported += 1
+                save_workbook_or_fail(workbook, excel_path)
 
                 if args.sleep > 0:
                     time.sleep(args.sleep)
@@ -338,11 +402,32 @@ def main() -> int:
             cursor = end_cursor
             page += 1
             print(f'=========>>>>>>>>>user_id:{user_id} page: {page}')
+    except RuntimeError as exc:
+        return fail(str(exc))
     finally:
         try:
-            workbook.save(excel_path)
-        except OSError as exc:
-            return fail(f"Failed saving Excel {excel_path}: {exc}")
+            workbook.close()
+        except Exception:
+            pass
+
+    print(
+        json.dumps(
+            {
+                "summary": {
+                    "user_id": user_id,
+                    "total_count_reported": total_count,
+                    "edge_field": resolved_edge_field,
+                    "rows_already_in_excel": len(seen_ids) - count_exported,
+                    "rows_exported_this_run": count_exported,
+                    "detail_ok": enriched_ok,
+                    "detail_fail": enriched_fail,
+                    "excel_path": str(excel_path),
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
 
 
 if __name__ == "__main__":
